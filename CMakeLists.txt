@@ -25,13 +25,15 @@ target_link_libraries(waypoint_navigator
     Threads::Threads
 )
 
+add_library(shiviz_px4_navigation::WaypointNavigator ALIAS waypoint_navigator)
+
 # --- Build the uav_control executable ---
 add_executable(uav_control
     src/main.cpp
 )
 
 target_include_directories(uav_control
-    PRIVATE
+    PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 

@@ -1,5 +1,5 @@
 // main.cpp
-#include "waypoint_navigator.hpp"
+#include "waypoint_navigator/waypoint_navigator.hpp"
 #include <mavsdk/mavsdk.h>
 #include <iostream>
 #include <thread>
