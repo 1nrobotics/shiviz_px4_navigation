@@ -27,19 +27,23 @@ target_link_libraries(waypoint_navigator
 
 add_library(shiviz_px4_navigation::WaypointNavigator ALIAS waypoint_navigator)
 
-# --- Build the uav_control executable ---
-add_executable(uav_control
-    src/main.cpp
-)
+# === Only build executable if this is the top-level project ===
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
 
-target_include_directories(uav_control
-    PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
+    add_executable(uav_control
+        src/main.cpp
+    )
 
-target_link_libraries(uav_control
-    waypoint_navigator
-)
+    target_include_directories(uav_control
+        PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(uav_control
+        PRIVATE waypoint_navigator
+    )
+
+endif()
 
 # if(NOT MSVC)
 #     target_compile_options(uav_control PRIVATE -Wall -Wextra)
