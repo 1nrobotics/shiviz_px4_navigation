@@ -44,6 +44,7 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
     )
 
 endif()
+install(FILES config/waypoints.yaml DESTINATION ${CMAKE_BINARY_DIR}/config)
 
 # if(NOT MSVC)
 #     target_compile_options(uav_control PRIVATE -Wall -Wextra)
