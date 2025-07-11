@@ -392,4 +392,8 @@ namespace waypoint_navigator
         }
         return angle_deg;
     }
+
+    waypoint_navigator::TaskState WaypointNavigator::getTaskState() const {
+        return task_state_.load(std::memory_order_relaxed);
+    }
 } // namespace waypoint_navigator

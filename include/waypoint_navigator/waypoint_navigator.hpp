@@ -62,6 +62,7 @@ namespace waypoint_navigator
         // ToDo: we should not need to expose following for safety reasons, but for now we do
         void doArm();
         void doDisarm();
+        waypoint_navigator::TaskState getTaskState() const;
 
     private:
         void runner();

@@ -14,6 +14,12 @@ void wait_until_discover(Mavsdk &mavsdk)
         std::cout << "Waiting for drone...\n";
     }
 }
+// 延时函数
+void delay(int seconds)
+{
+    std::cout << "Waiting for " << seconds << " seconds..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+}
 
 int main(int argc, char **argv)
 {
@@ -25,8 +31,12 @@ int main(int argc, char **argv)
 
     const std::string yaml_path = argv[1];
 
-    Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
-    auto result = mavsdk.add_any_connection("udpin://0.0.0.0:14540");
+    // Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
+    mavsdk::Mavsdk mavsdk{mavsdk::Mavsdk::Configuration{mavsdk::Mavsdk::ComponentType::GroundStation}};
+
+    // auto result = mavsdk.add_any_connection("udpin://0.0.0.0:14540");
+    auto result = mavsdk.add_any_connection("udp://0.0.0.0:14540");
+
     if (result != ConnectionResult::Success)
     {
         std::cerr << "Connection failed: " << result << "\n";
@@ -58,40 +68,48 @@ int main(int argc, char **argv)
         std::cout << "Yaw: " << telem_euler.yaw_deg << " deg\n"; });
     telemetry.subscribe_flight_mode([&navigator](Telemetry::FlightMode flight_mode)
                                     {
-        navigator.updateFlightMode(flight_mode);
-        std::cout << "Flight mode: " << flight_mode << "\n"; });
-    while (true)
-    {
-        std::cout << "\nA: Arm\nD: Disarm\nT: Takeoff\nM: Mission\nL: Land\nQ: Quit\nEnter command: ";
-        char cmd;
-        std::cin >> cmd;
-        cmd = std::toupper(cmd);
+    navigator.updateFlightMode(flight_mode);
+    std::cout << "Flight mode: " << flight_mode << "\n"; });
 
-        if (cmd == 'A')
-        {
-            navigator.doArm();
-        }
-        else if (cmd == 'D')
-        {
-            navigator.doDisarm();
-        }
-        else if (cmd == 'T')
-        {
-            navigator.setTaskState(waypoint_navigator::TaskState::TAKEOFF);
-        }
-        else if (cmd == 'M')
-        {
-            navigator.setTaskState(waypoint_navigator::TaskState::MISSION);
-        }
-        else if (cmd == 'L')
-        {
-            navigator.setTaskState(waypoint_navigator::TaskState::LAND);
-        }
-        else if (cmd == 'Q')
-        {
+
+    //Starting autonomous mission sequence
+    std::cout << "\n=== Starting autonomous mission sequence ===\n";
+
+    // 1. 解锁
+    std::cout << "Step 1: Arming...\n";
+    navigator.doArm();
+    delay(3);  // 等待解锁完成
+
+    // 2. 起飞
+    std::cout << "Step 2: Taking off...\n";
+    navigator.setTaskState(waypoint_navigator::TaskState::TAKEOFF);
+    delay(10);  // 等待起飞到目标高度
+
+    // 3. 执行任务
+    std::cout << "Step 3: Starting mission...\n";        
+    while (true) {
+        navigator.setTaskState(waypoint_navigator::TaskState::MISSION);
+        auto current_state = navigator.getTaskState();
+        
+        if (current_state == waypoint_navigator::TaskState::LAND || 
+            current_state == waypoint_navigator::TaskState::IDLE) {
+            std::cout << "Mission completed. Exiting mission loop.\n";
             break;
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
     }
 
+    // //4.降落
+    // std::cout << "Step 4: Landing...\n";
+    // navigator.setTaskState(waypoint_navigator::TaskState::LAND);
+    // 等待降落完成
+    // while (navigator.getTaskState() != waypoint_navigator::TaskState::IDLE) {
+    //     std::cout <<111111<<std::endl;
+    //     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    //     break;
+    //     std::cout <<2222222<<std::endl;
+    // }
+    // std::cout <<3333333<<std::endl;
     return 0;
 }
