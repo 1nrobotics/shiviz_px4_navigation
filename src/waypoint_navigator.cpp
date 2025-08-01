@@ -159,6 +159,7 @@ namespace waypoint_navigator
                 }
                 doLand();
                 has_taken_off_ = false; // Reset after landing
+                waypoint_index_ = 0; // Reset waypoint index after landing
                 break;
             }
             std::this_thread::sleep_for(100ms);
@@ -196,16 +197,17 @@ namespace waypoint_navigator
     void WaypointNavigator::doTakeoff()
     {
         std::cout << "Taking off...\n";
-        auto result = action_->takeoff();
-        if (result != Action::Result::Success)
-        {
-            std::cerr << "Takeoff failed: " << result << "\n";
+
+        action_->takeoff_async([this](mavsdk::Action::Result result) {
+            if (result != mavsdk::Action::Result::Success) {
+                std::cerr << "Takeoff failed: " << result << "\n";
+                task_state_ = TaskState::IDLE;
+                return;
+            }
+
+            std::cout << "Takeoff complete.\n";
             task_state_ = TaskState::IDLE;
-            return;
-        }
-        std::this_thread::sleep_for(10s);
-        std::cout << "Takeoff complete.\n";
-        task_state_ = TaskState::IDLE;
+        });
     }
 
     void WaypointNavigator::doRunMission()
