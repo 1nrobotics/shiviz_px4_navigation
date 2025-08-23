@@ -1,57 +1,58 @@
 cmake_minimum_required(VERSION 3.10.2)
 
-project(uav_control)
+project(px4_offboard)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(MAVSDK REQUIRED)
 find_package(Threads REQUIRED)
+# find_package(Eigen3 REQUIRED)
+find_package(catkin REQUIRED COMPONENTS
+  geometry_msgs
+  mavros_msgs
+  roscpp
+  std_msgs
+  tf2
+  tf2_ros
+  eigen_conversions
+)
+
+catkin_package(
+#  INCLUDE_DIRS include
+#  LIBRARIES px4_offb
+  CATKIN_DEPENDS geometry_msgs mavros_msgs roscpp std_msgs tf2 tf2_ros
+#  DEPENDS system_lib
+#   DEPENDS Eigen3
+)
+set(YAML_BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries")
 
 add_subdirectory(thirdparty/yaml-cpp)
 
-add_library(waypoint_navigator
-    src/waypoint_navigator.cpp
+add_executable(${PROJECT_NAME}_node 
+  src/main.cpp 
+  src/waypoint_navigator.cpp 
 )
 
-target_include_directories(waypoint_navigator
+target_include_directories(${PROJECT_NAME}_node
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${catkin_INCLUDE_DIRS}
 )
 
-target_link_libraries(waypoint_navigator
-    MAVSDK::mavsdk
-    yaml-cpp::yaml-cpp
+target_link_libraries(${PROJECT_NAME}_node
+    ${catkin_LIBRARIES}
+    # yaml-cpp::yaml-cpp
+    yaml-cpp
     Threads::Threads
 )
 
-add_library(shiviz_px4_navigation::WaypointNavigator ALIAS waypoint_navigator)
-
-# === Only build executable if this is the top-level project ===
-if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
-
-    add_executable(uav_control
-        src/main.cpp
-    )
-
-    target_include_directories(uav_control
-        PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-
-    target_link_libraries(uav_control
-        PRIVATE waypoint_navigator
-    )
-
-endif()
 install(FILES config/waypoints.yaml DESTINATION ${CMAKE_BINARY_DIR}/config)
-
-# if(NOT MSVC)
-#     target_compile_options(uav_control PRIVATE -Wall -Wextra)
-# else()
-#     target_compile_options(uav_control PRIVATE /W2)
-# endif()
-
-# if(MINGW OR MSVC)
-#     target_compile_definitions(uav_control PRIVATE "-D_USE_MATH_DEFINES")
-# endif()
+install(TARGETS ${PROJECT_NAME}_node
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+install(TARGETS yaml-cpp
+    EXPORT yaml-cpp-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_PREFIX}/lib
+    LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/lib
+    RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX}/bin
+)

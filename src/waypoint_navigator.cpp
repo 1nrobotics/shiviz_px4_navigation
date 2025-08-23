@@ -6,60 +6,85 @@
 #include <chrono>
 #include <yaml-cpp/yaml.h>
 #include <fstream>
-using namespace mavsdk;
 using namespace std::chrono;
 
 namespace waypoint_navigator
 {
-    WaypointNavigator::WaypointNavigator(std::shared_ptr<System> system)
-        : action_(std::make_shared<Action>(*system)),
-          telemetry_(std::make_shared<Telemetry>(*system)),
-          offboard_(std::make_shared<Offboard>(*system)),
+    WaypointNavigator::WaypointNavigator(ros::NodeHandle &node_handle)
+        : nh_(node_handle),
           task_state_(TaskState::IDLE),
-          running_(true),
           has_taken_off_(false),
           has_heading_target_(false),
           has_aligned_to_path_yaw_(false),
           has_reached_waypoint_pos_(false),
           waypoint_index_(0)
     {
-        // Define some example waypoints (north, east, down, yaw_deg)
+        // Define some example waypoints (north, east, up, yaw_deg)
         waypoints_ = {
-            {5.0f, 0.0f, -1.5f, 0.0f},
-            {5.0f, 5.0f, -1.5f, 90.0f},
-            {0.0f, 5.0f, -1.5f, 180.0f}};
+            {5.0f, 0.0f, 1.5f, 0.0f},
+            {5.0f, 5.0f, 1.5f, -90.0f},
+            {0.0f, 5.0f, 1.5f, 180.0f}};
+        nh_.param<std::string>("waypoint_file", waypoint_file_, "/path/to/default/waypoints.yaml");
 
-        // Start the runner thread
-        runnerThread_ = std::thread(&WaypointNavigator::runner, this);
+        cmd_sub_ = nh_.subscribe<std_msgs::Byte>("/user_cmd", 1, &WaypointNavigator::cmdCallback, this);
+        uav_state_sub_ = nh_.subscribe<mavros_msgs::State>("/mavros/state", 1, &WaypointNavigator::uavStateCallback, this);
+        uav_pose_enu_sub_ = nh_.subscribe<geometry_msgs::PoseStamped>("/mavros/local_position/pose", 1, &WaypointNavigator::uavPoseCallback, this);
+
+        local_pos_sp_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/mavros/setpoint_position/local", 10);
+        local_raw_sp_pub_ = nh_.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
+
+        arming_client_ = nh_.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
+        takeoff_client_ = nh_.serviceClient<mavros_msgs::CommandTOL>("/mavros/cmd/takeoff");
+        land_client_ = nh_.serviceClient<mavros_msgs::CommandTOL>("/mavros/cmd/land");
+        set_mode_client_ = nh_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
+
+        mission_timer_ = nh_.createTimer(ros::Duration(0.1), &WaypointNavigator::missionTimerCallback, this);
+
+        ROS_INFO("WaypointNavigator node is ready!");
     }
 
-    WaypointNavigator::~WaypointNavigator()
+    void WaypointNavigator::cmdCallback(const std_msgs::Byte::ConstPtr &msg)
     {
-        running_ = false;
-        if (runnerThread_.joinable())
+        int cmd = msg->data;
+
+        ROS_INFO("User command received: %d", cmd);
+
+        switch (cmd)
         {
-            runnerThread_.join();
-            std::cout << "WaypointNavigator instance destroyed\n";
+        case 1:
+        {
+            if (setOffboardMode())
+            {
+                ROS_INFO("offboard mode activated going to run takeoff");
+                setTaskState(TaskState::TAKEOFF);
+            }
+            break;
         }
+        case 2:
+            setTaskState(TaskState::MISSION);
+            break;
+        case 3:
+            setTaskState(TaskState::LAND);
+            break;
+        default:
+            ROS_WARN("Unknown command: %d", cmd);
+            break;
+        }
+    }
+
+    void WaypointNavigator::uavStateCallback(const mavros_msgs::State::ConstPtr &msg)
+    {
+        uav_current_state_ = *msg;
+    }
+
+    void WaypointNavigator::uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr &msg)
+    {
+        uav_local_pose_enu_ = *msg;
     }
 
     void WaypointNavigator::setTaskState(TaskState new_state)
     {
         task_state_.store(new_state, std::memory_order_relaxed);
-    }
-
-    void WaypointNavigator::updateLocalPose(const Telemetry::PositionVelocityNed &position,
-                                            const Telemetry::EulerAngle &attitude)
-    {
-        std::lock_guard<std::mutex> lock(pose_mutex_);
-        local_position_ = position;
-        attitude_ = attitude;
-    }
-
-    void WaypointNavigator::updateFlightMode(const Telemetry::FlightMode &flight_mode)
-    {
-        std::lock_guard<std::mutex> lock(flight_mode_mutex_);
-        current_flight_mode_ = flight_mode;
     }
 
     bool WaypointNavigator::loadWaypointsFromYaml(const std::string &yaml_path)
@@ -106,108 +131,77 @@ namespace waypoint_navigator
         }
     }
 
-    void WaypointNavigator::runner()
+    void WaypointNavigator::missionTimerCallback(const ros::TimerEvent &)
     {
-        while (running_)
+        TaskState current_state = task_state_.load(std::memory_order_relaxed);
+        switch (current_state)
         {
-            TaskState current_state = task_state_.load(std::memory_order_relaxed);
-            switch (current_state)
+        case TaskState::IDLE:
+            // idle, do nothing
+            break;
+        case TaskState::TAKEOFF:
+            if (!has_taken_off_)
             {
-            case TaskState::IDLE:
-                // idle, do nothing
-                break;
-            case TaskState::TAKEOFF:
-                if (!has_taken_off_)
                 {
+                    std::lock_guard<std::mutex> lock(pose_mutex_);
+                    take_off_pose_enu_ = uav_local_pose_enu_;
+                    take_off_yaw_enu_ = getYawFromPose(uav_local_pose_enu_);
+                    if (std::isnan(take_off_pose_enu_.pose.position.x) || std::isnan(take_off_pose_enu_.pose.position.y) ||
+                        std::isnan(take_off_pose_enu_.pose.position.z) || std::isnan(take_off_yaw_enu_))
                     {
-                        std::lock_guard<std::mutex> lock(pose_mutex_);
-                        take_off_position_ = local_position_;
-                        take_off_attitude_ = attitude_;
-                        if (std::isnan(take_off_position_.position.north_m) || std::isnan(take_off_position_.position.east_m) ||
-                            std::isnan(take_off_position_.position.down_m) || std::isnan(take_off_attitude_.yaw_deg))
-                        {
-                            std::cerr << "Error: One or more values of local pose feedback are NaN!" << std::endl;
-                            offboard_->stop();
-                            task_state_ = TaskState::LAND;
-                        }
+                        std::cerr << "Error: One or more values of local pose feedback are NaN!" << std::endl;
+                        // offboard_->stop();
+                        task_state_ = TaskState::LAND;
                     }
-                    doTakeoff();
-                    has_taken_off_ = true;
                 }
+                doTakeoff();
+                has_taken_off_ = true;
+            }
+            doTakeoff();
+            break;
+        case TaskState::MISSION:
+            if (!has_taken_off_)
+            {
+                std::cerr << "Cannot run mission without taking off first.\n";
+                task_state_ = TaskState::IDLE;
                 break;
-            case TaskState::MISSION:
-                if (!has_taken_off_)
-                {
-                    std::cerr << "Cannot run mission without taking off first.\n";
-                    task_state_ = TaskState::IDLE;
-                    break;
-                }
+            }
+            if (uav_current_state_.mode != "OFFBOARD")
+            {
                 if (!setOffboardMode())
                 {
                     std::cerr << "Failed to set Offboard mode.\n";
                     task_state_ = TaskState::IDLE;
                     break;
                 }
-                doRunMission();
-                break;
-            case TaskState::LAND:
-                if (!has_taken_off_)
-                {
-                    std::cerr << "Cannot land without taking off first.\n";
-                    task_state_ = TaskState::IDLE;
-                    break;
-                }
-                doLand();
-                has_taken_off_ = false; // Reset after landing
-                waypoint_index_ = 0; // Reset waypoint index after landing
+            }
+            doRunMission();
+            break;
+        case TaskState::LAND:
+            if (!has_taken_off_)
+            {
+                std::cerr << "Cannot land without taking off first.\n";
+                task_state_ = TaskState::IDLE;
                 break;
             }
-            std::this_thread::sleep_for(100ms);
-        }
-    }
-
-    void WaypointNavigator::doArm()
-    {
-        std::cout << "Arming...\n";
-        auto result = action_->arm();
-        if (result != Action::Result::Success)
-        {
-            std::cerr << "Arming failed: " << result << "\n";
-        }
-        else
-        {
-            std::cout << "Armed successfully.\n";
-        }
-    }
-
-    void WaypointNavigator::doDisarm()
-    {
-        std::cout << "Disarming...\n";
-        auto result = action_->disarm();
-        if (result != Action::Result::Success)
-        {
-            std::cerr << "Disarming failed: " << result << "\n";
-        }
-        else
-        {
-            std::cout << "Disarmed successfully.\n";
+            doLand();
+            has_taken_off_ = false; // Reset after landing
+            waypoint_index_ = 0;    // Reset waypoint index after landing
+            break;
         }
     }
 
     void WaypointNavigator::doTakeoff()
     {
-        std::cout << "Taking off...\n";
-
-        action_->takeoff_async([this](mavsdk::Action::Result result) {
-            if (result != mavsdk::Action::Result::Success) {
-                std::cerr << "Takeoff failed: " << result << "\n";
-                task_state_ = TaskState::IDLE;
-                return;
-            }
-
-            std::cout << "Takeoff complete.\n";
-            task_state_ = TaskState::IDLE;
-        });
+        geometry_msgs::PoseStamped local_pose_setpoint;
+        local_pose_setpoint.pose.position.x = take_off_pose_enu_.pose.position.x;
+        local_pose_setpoint.pose.position.y = take_off_pose_enu_.pose.position.y;
+        local_pose_setpoint.pose.position.z = 2.0;
+        local_pose_setpoint.header.stamp = ros::Time::now();
+        setYawToPose(local_pose_setpoint, deg2rad(take_off_yaw_enu_));
+        local_pos_sp_pub_.publish(local_pose_setpoint);
+        ROS_INFO("Vehicle taking off...");
+        return;
     }
 
     void WaypointNavigator::doRunMission()
@@ -215,7 +209,7 @@ namespace waypoint_navigator
         if (waypoints_.empty())
         {
             std::cout << "Waypoints not loaded, aborting mission.\n";
-            offboard_->stop();
+            // offboard_->stop();
             task_state_ = TaskState::LAND;
             return;
         }
@@ -223,30 +217,30 @@ namespace waypoint_navigator
         if (waypoint_index_ >= waypoints_.size())
         {
             std::cout << "Mission complete. Initiating landing sequence.\n";
-            offboard_->stop();
+            // offboard_->stop();
             task_state_ = TaskState::LAND;
             return;
         }
 
-        auto [north_wp, east_wp, down_wp, yaw_wp] = waypoints_[waypoint_index_];
+        auto [north_wp, east_wp, up_wp, yaw_wp_from_north] = waypoints_[waypoint_index_];
 
-        float current_position_north;
         float current_position_east;
-        float current_position_down;
-        float current_yaw;
+        float current_position_north;
+        float current_position_up;
+        float current_yaw_from_north_rad;
 
         {
             std::lock_guard<std::mutex> lock(pose_mutex_);
-            current_position_north = local_position_.position.north_m;
-            current_position_east = local_position_.position.east_m;
-            current_position_down = local_position_.position.down_m;
-            current_yaw = attitude_.yaw_deg;
+            current_position_east = uav_local_pose_enu_.pose.position.x;
+            current_position_north = uav_local_pose_enu_.pose.position.y;
+            current_position_up = uav_local_pose_enu_.pose.position.z;
+            current_yaw_from_north_rad = getYawFromPose(uav_local_pose_enu_) - M_PI / 2; // Convert ENU yaw to NED yaw
 
             if (std::isnan(current_position_north) || std::isnan(current_position_east) ||
-                std::isnan(current_position_down) || std::isnan(current_yaw))
+                std::isnan(current_position_up) || std::isnan(current_yaw_from_north_rad))
             {
                 std::cerr << "Error: One or more values of local pose feedback are NaN!" << std::endl;
-                offboard_->stop();
+                // offboard_->stop();
                 task_state_ = TaskState::LAND;
             }
         }
@@ -258,37 +252,58 @@ namespace waypoint_navigator
             {
                 if (waypoint_index_ == 0)
                 {
-                    current_setpoint_.north_m = take_off_position_.position.north_m;
-                    current_setpoint_.east_m = take_off_position_.position.east_m;
+                    current_setpoint_.pose.position.x = take_off_pose_enu_.pose.position.x;
+                    current_setpoint_.pose.position.y = take_off_pose_enu_.pose.position.y;
+                    current_setpoint_.pose.position.z = 2.0;
                 }
                 else
                 {
-                    current_setpoint_.north_m = std::get<0>(waypoints_[waypoint_index_ - 1]);
-                    current_setpoint_.east_m = std::get<1>(waypoints_[waypoint_index_ - 1]);
+                    current_setpoint_.pose.position.x = std::get<0>(waypoints_[waypoint_index_ - 1]);
+                    current_setpoint_.pose.position.y = std::get<1>(waypoints_[waypoint_index_ - 1]);
+                    current_setpoint_.pose.position.z = std::get<2>(waypoints_[waypoint_index_ - 1]);
                 }
-
-                current_setpoint_.yaw_deg = atan2(east_wp - current_setpoint_.east_m, north_wp - current_setpoint_.north_m) * 180.0f / M_PI; // Convert to degrees
-                print_once_("Setting heading target to: " + std::to_string(current_setpoint_.yaw_deg) + " degrees");
+                double current_north = current_setpoint_.pose.position.x; // ENU y -> NEU x
+                double current_east = current_setpoint_.pose.position.y;  // ENU x -> NEU y
+                double delta_north = north_wp - current_north;
+                double delta_east = east_wp - current_east;
+                double path_yaw_from_east = atan2(delta_north, delta_east);
+                setYawToPose(current_setpoint_, path_yaw_from_east);
+                print_once_("Setting heading target to: " + std::to_string(rad2deg(path_yaw_from_east)) + " degrees");
 
                 has_heading_target_ = true;
             }
 
-            float heading_error = normalize_angle(current_setpoint_.yaw_deg - current_yaw);
+            float heading_error = normalize_angle(rad2deg(getYawFromPose(current_setpoint_) - M_PI_2 - current_yaw_from_north_rad));
 
             if (std::abs(heading_error) > 5.0f) // Allow some tolerance
             {
-                print_once_("Aligning to path yaw: " + std::to_string(current_setpoint_.yaw_deg) + ", remaining angle to adjust: " + std::to_string(heading_error) + " degrees");
-                Offboard::PositionNedYaw setpoint{};
-                setpoint.north_m = current_setpoint_.north_m;
-                setpoint.east_m = current_setpoint_.east_m;
-                setpoint.down_m = down_wp;
-                setpoint.yaw_deg = current_setpoint_.yaw_deg;
-                offboard_->set_position_ned(setpoint);
+                // std::cout << "waypoint index: " << waypoint_index_ << std::endl;
+                print_once_(" Aligning to path yaw (from north): " + std::to_string(rad2deg(getYawFromPose(current_setpoint_) - M_PI_2)) + ", remaining angle to adjust: " + std::to_string(heading_error) + " degrees");
+                mavros_msgs::PositionTarget pose_sp;
+                pose_sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+                // We want only position + yaw; ignore velocity, acceleration, and yaw rate
+                pose_sp.type_mask =
+                    mavros_msgs::PositionTarget::IGNORE_VX |
+                    mavros_msgs::PositionTarget::IGNORE_VY |
+                    mavros_msgs::PositionTarget::IGNORE_VZ |
+                    mavros_msgs::PositionTarget::IGNORE_AFX |
+                    mavros_msgs::PositionTarget::IGNORE_AFY |
+                    mavros_msgs::PositionTarget::IGNORE_AFZ |
+                    mavros_msgs::PositionTarget::IGNORE_YAW_RATE;
+
+                // current waypoint is in NEU frame whereas pose_sp is in ENU frame
+                pose_sp.position.x = current_setpoint_.pose.position.y;
+                pose_sp.position.y = current_setpoint_.pose.position.x; // meters
+                pose_sp.position.z = current_setpoint_.pose.position.z;
+
+                // --- Set yaw in radians ---
+                pose_sp.yaw = getYawFromPose(current_setpoint_);
+                local_raw_sp_pub_.publish(pose_sp);
                 return;
             }
             else
             {
-                print_once_("Aligned to path yaw: " + std::to_string(current_setpoint_.yaw_deg) + " degrees");
+                print_once_("Aligned to path yaw from north: " + std::to_string(rad2deg(getYawFromPose(current_setpoint_) - M_PI_2)) + " degrees");
                 has_aligned_to_path_yaw_ = true; // Mark as aligned to path yaw
             }
         }
@@ -298,42 +313,71 @@ namespace waypoint_navigator
         {
             print_once_("Going to waypoint " + std::to_string(waypoint_index_ + 1) +
                         ": (" + std::to_string(north_wp) + ", " + std::to_string(east_wp) +
-                        ", " + std::to_string(down_wp) + ") with yaw " + std::to_string(yaw_wp));
-            Offboard::PositionNedYaw setpoint{};
-            setpoint.north_m = north_wp;
-            setpoint.east_m = east_wp;
-            setpoint.down_m = down_wp;
-            setpoint.yaw_deg = current_setpoint_.yaw_deg;
-            offboard_->set_position_ned(setpoint);
+                        ", " + std::to_string(up_wp) + ") with yaw " + std::to_string(yaw_wp_from_north));
+            mavros_msgs::PositionTarget pose_sp;
+            pose_sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+            // We want only position + yaw; ignore velocity, acceleration, and yaw rate
+            pose_sp.type_mask =
+                mavros_msgs::PositionTarget::IGNORE_VX |
+                mavros_msgs::PositionTarget::IGNORE_VY |
+                mavros_msgs::PositionTarget::IGNORE_VZ |
+                mavros_msgs::PositionTarget::IGNORE_AFX |
+                mavros_msgs::PositionTarget::IGNORE_AFY |
+                mavros_msgs::PositionTarget::IGNORE_AFZ |
+                mavros_msgs::PositionTarget::IGNORE_YAW_RATE;
+            pose_sp.position.x = east_wp; // meters
+            pose_sp.position.y = north_wp;
+            pose_sp.position.z = up_wp;
+            pose_sp.yaw = getYawFromPose(current_setpoint_);
+            local_raw_sp_pub_.publish(pose_sp);
 
-            float dx = north_wp - current_position_north;
-            float dy = east_wp - current_position_east;
-            float dz = down_wp - current_position_down;
+            float dx = east_wp - current_position_east;
+            float dy = north_wp - current_position_north;
+            float dz = up_wp - current_position_up;
             float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+            // std::cout << "Distance to waypoint " << (waypoint_index_ + 1) << ": " << dist << " meters\n";
+            // std::cout << "east_wp: " << east_wp << " meters\n";
+            // std::cout << "north_wp: " << north_wp << " meters\n";
+            // std::cout << "up_wp: " << up_wp << " meters\n";
+            // std::cout << "current_position_east: " << current_position_east << " meters\n";
+            // std::cout << "current_position_north: " << current_position_north << " meters\n";
+            // std::cout << "current_position_up: " << current_position_up << " meters\n";
 
             if (dist < 0.2f)
             {
                 has_reached_waypoint_pos_ = true; // Mark as reached waypoint position
                 print_once_("Reached waypoint number: " + std::to_string(waypoint_index_ + 1) + "'s position" +
                             ": (" + std::to_string(north_wp) + ", " + std::to_string(east_wp) +
-                            ", " + std::to_string(down_wp) + ")");
+                            ", " + std::to_string(up_wp) + ")");
             }
 
             return;
         }
         // Step 3: Position reached, align to waypoint yaw
-        float final_yaw_error = normalize_angle(yaw_wp - current_yaw);
+        float final_yaw_error = normalize_angle(yaw_wp_from_north - rad2deg(current_yaw_from_north_rad));
 
         if (std::abs(final_yaw_error) > 5.0f) // Allow some tolerance
         {
-            print_once_("Aligning to waypoint yaw: " + std::to_string(yaw_wp) +
+            print_once_("Aligning to waypoint yaw: " + std::to_string(yaw_wp_from_north) +
                         ", remaining angle to adjust: " + std::to_string(final_yaw_error) + " degrees");
-            Offboard::PositionNedYaw align_setpoint{};
-            align_setpoint.north_m = north_wp;
-            align_setpoint.east_m = east_wp;
-            align_setpoint.down_m = down_wp;
-            align_setpoint.yaw_deg = yaw_wp;
-            offboard_->set_position_ned(align_setpoint);
+
+            mavros_msgs::PositionTarget pose_sp;
+            pose_sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+            // We want only position + yaw; ignore velocity, acceleration, and yaw rate
+            pose_sp.type_mask =
+                mavros_msgs::PositionTarget::IGNORE_VX |
+                mavros_msgs::PositionTarget::IGNORE_VY |
+                mavros_msgs::PositionTarget::IGNORE_VZ |
+                mavros_msgs::PositionTarget::IGNORE_AFX |
+                mavros_msgs::PositionTarget::IGNORE_AFY |
+                mavros_msgs::PositionTarget::IGNORE_AFZ |
+                mavros_msgs::PositionTarget::IGNORE_YAW_RATE;
+            pose_sp.position.y = north_wp;
+            pose_sp.position.x = east_wp;
+            pose_sp.position.z = up_wp;
+            pose_sp.yaw = deg2rad(yaw_wp_from_north) + M_PI / 2; // NED yaw to ENU yaw
+            local_raw_sp_pub_.publish(pose_sp);
             return;
         }
         std::cout << "Reached waypoint " << (waypoint_index_ + 1) << "\n";
@@ -346,39 +390,98 @@ namespace waypoint_navigator
 
     void WaypointNavigator::doLand()
     {
-        std::cout << "Landing...\n";
-        auto result = action_->land();
-        if (result != Action::Result::Success)
+        ros::Rate rate(20.0);
+
+        mavros_msgs::CommandTOL land_cmd;
+        land_cmd.request.altitude = 0;  // ignored by PX4
+        land_cmd.request.latitude = 0;  // optional (NAN/0 if unused)
+        land_cmd.request.longitude = 0; // optional (NAN/0 if unused)
+        land_cmd.request.min_pitch = 0.0;
+        land_cmd.request.yaw = 0.0;
+
+        while (!(land_client_.call(land_cmd) && land_cmd.response.success))
         {
-            std::cerr << "Landing failed: " << result << "\n";
+            ROS_WARN("Landing command failed, retrying...");
+            ros::spinOnce();
+            rate.sleep();
         }
-        else
-        {
-            std::cout << "Landing started.\n";
-        }
+
+        ROS_INFO("Vehicle landing...");
         task_state_ = TaskState::IDLE;
     }
 
     bool WaypointNavigator::setOffboardMode()
     {
-        if (!offboard_->is_active())
-        {
-            Offboard::PositionNedYaw initial_setpoint{};
-            initial_setpoint.down_m = -2.0f;
-            initial_setpoint.north_m = take_off_position_.position.north_m;
-            initial_setpoint.east_m = take_off_position_.position.east_m;
-            initial_setpoint.yaw_deg = take_off_attitude_.yaw_deg;
-            offboard_->set_position_ned(initial_setpoint);
+        ros::Rate rate(20.0);
+        ros::Time last_request = ros::Time::now();
+        mavros_msgs::PositionTarget init_sp;
+        init_sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED; // To be converted to NED in setpoint_raw plugin
+        // FIXME check
+        init_sp.position.x = uav_local_pose_enu_.pose.position.x;
+        init_sp.position.y = uav_local_pose_enu_.pose.position.y;
+        init_sp.position.z = uav_local_pose_enu_.pose.position.z;
+        init_sp.velocity.x = 0;
+        init_sp.velocity.y = 0;
+        init_sp.velocity.z = 0;
+        init_sp.acceleration_or_force.x = 0;
+        init_sp.acceleration_or_force.y = 0;
+        init_sp.acceleration_or_force.z = 0;
+        init_sp.yaw = 0;
 
-            auto result = offboard_->start();
-            if (result != Offboard::Result::Success)
-            {
-                std::cerr << "Failed to set offboard mode: " << result << "\n";
-                return false;
-            }
-            std::cout << "Offboard mode set successfully.\n";
+        // send a few setpoints before starting
+        for (int i = 10; ros::ok() && i > 0; --i)
+        {
+            local_raw_sp_pub_.publish(init_sp);
+            ros::spinOnce();
+            rate.sleep();
         }
-        return true;
+
+        mavros_msgs::SetMode offb_set_mode;
+        offb_set_mode.request.custom_mode = "OFFBOARD";
+
+        bool is_mode_ready = false;
+        last_request = ros::Time::now();
+        mavros_msgs::CommandBool arm_cmd;
+
+        arm_cmd.request.value = true;
+
+        while (!is_mode_ready)
+        {
+            if (uav_current_state_.mode != "OFFBOARD" &&
+                (ros::Time::now() - last_request > ros::Duration(5.0)))
+            {
+                ROS_INFO("Try set offboard");
+                if (set_mode_client_.call(offb_set_mode) &&
+                    offb_set_mode.response.mode_sent)
+                {
+                    ROS_INFO("Offboard enabled");
+                }
+                last_request = ros::Time::now();
+            }
+            else
+            {
+                if (!uav_current_state_.armed && (ros::Time::now() - last_request > ros::Duration(1.0)))
+                {
+                    ROS_INFO("Try Arming");
+                    if (arming_client_.call(arm_cmd) && arm_cmd.response.success)
+                    {
+                        ROS_INFO("Vehicle armed");
+                    }
+                    last_request = ros::Time::now();
+                }
+            }
+            local_raw_sp_pub_.publish(init_sp);
+            is_mode_ready = (uav_current_state_.mode == "OFFBOARD" && uav_current_state_.armed);
+            ros::spinOnce();
+            rate.sleep();
+        }
+
+        if (is_mode_ready)
+        {
+            ROS_INFO("Offboard mode activated!");
+        }
+
+        return is_mode_ready;
     }
 
     float WaypointNavigator::normalize_angle(float angle_deg)
@@ -393,5 +496,30 @@ namespace waypoint_navigator
             angle_deg += 360; // Add 360 degrees if the angle is less than or equal to -180
         }
         return angle_deg;
+    }
+
+    double WaypointNavigator::getYawFromPose(const geometry_msgs::PoseStamped &pose_msg)
+    {
+        tf::Quaternion q(
+            pose_msg.pose.orientation.x,
+            pose_msg.pose.orientation.y,
+            pose_msg.pose.orientation.z,
+            pose_msg.pose.orientation.w);
+
+        double roll, pitch, yaw;
+        tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
+
+        return yaw; // in radians, range [-pi, pi]
+    }
+
+    void WaypointNavigator::setYawToPose(geometry_msgs::PoseStamped &pose_msg, double yaw)
+    {
+        tf::Quaternion q;
+        q.setRPY(0.0, 0.0, yaw); // roll = 0, pitch = 0, yaw = given value
+
+        pose_msg.pose.orientation.x = q.x();
+        pose_msg.pose.orientation.y = q.y();
+        pose_msg.pose.orientation.z = q.z();
+        pose_msg.pose.orientation.w = q.w();
     }
 } // namespace waypoint_navigator

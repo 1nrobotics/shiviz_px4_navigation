@@ -1,9 +1,5 @@
 #pragma once
 
-#include <mavsdk/plugins/action/action.h>
-#include <mavsdk/plugins/telemetry/telemetry.h>
-#include <mavsdk/plugins/offboard/offboard.h>
-
 #include <memory>
 #include <tuple>
 #include <vector>
@@ -11,6 +7,21 @@
 #include <atomic>
 #include <thread>
 #include <iostream>
+#include <cmath>
+
+#include <ros/ros.h>
+#include <eigen_conversions/eigen_msg.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <mavros_msgs/CommandBool.h>
+#include <mavros_msgs/SetMode.h>
+#include <mavros_msgs/State.h>
+#include <mavros_msgs/PositionTarget.h>
+#include <mavros_msgs/AttitudeTarget.h>
+#include <mavros_msgs/CommandTOL.h>
+#include <mavros_msgs/HomePosition.h>
+#include <std_msgs/Byte.h>
+
+#include <tf/transform_listener.h>
 
 class PrintOnce
 {
@@ -51,47 +62,47 @@ namespace waypoint_navigator
     class WaypointNavigator
     {
     public:
-        explicit WaypointNavigator(std::shared_ptr<mavsdk::System> system);
-        ~WaypointNavigator();
+        WaypointNavigator(ros::NodeHandle &node_handle);
+        ~WaypointNavigator() {};
 
         void setTaskState(TaskState new_state);
-        void updateLocalPose(const mavsdk::Telemetry::PositionVelocityNed &position,
-                             const mavsdk::Telemetry::EulerAngle &attitude);
-        void updateFlightMode(const mavsdk::Telemetry::FlightMode &flight_mode);
         bool loadWaypointsFromYaml(const std::string &yaml_path);
-        // ToDo: we should not need to expose following for safety reasons, but for now we do
-        void doArm();
-        void doDisarm();
+
+        // ROS callbacks
+        void cmdCallback(const std_msgs::Byte::ConstPtr &msg);
+        void uavStateCallback(const mavros_msgs::State::ConstPtr &msg);
+        void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr &msg);
+        void missionTimerCallback(const ros::TimerEvent &event);
+
+        void commandLand();
 
     private:
-        void runner();
         void doTakeoff();
         void doRunMission();
         void doLand();
         bool setOffboardMode();
         float normalize_angle(float angle_deg);
 
-        std::shared_ptr<mavsdk::Action> action_;
-        std::shared_ptr<mavsdk::Telemetry> telemetry_;
-        std::shared_ptr<mavsdk::Offboard> offboard_;
+        double getYawFromPose(const geometry_msgs::PoseStamped &pose_msg);
+        void setYawToPose(geometry_msgs::PoseStamped &pose_msg, double yaw);
 
-        std::thread runnerThread_;
+        inline double deg2rad(double degrees)
+        {
+            return degrees * M_PI / 180.0;
+        }
+
+        inline double rad2deg(double radians)
+        {
+            return radians * 180.0 / M_PI;
+        }
+
         std::atomic<TaskState> task_state_;
-
         std::mutex pose_mutex_;
-        mavsdk::Telemetry::PositionVelocityNed local_position_;
-        mavsdk::Telemetry::EulerAngle attitude_;
-
-        mavsdk::Telemetry::PositionVelocityNed take_off_position_;
-        mavsdk::Telemetry::EulerAngle take_off_attitude_;
-
         std::mutex flight_mode_mutex_;
-        mavsdk::Telemetry::FlightMode current_flight_mode_;
-
-        mavsdk::Offboard::PositionNedYaw current_setpoint_;
-
         std::vector<std::tuple<float, float, float, float>> waypoints_;
         std::atomic<bool> running_;
+        std::string waypoint_file_;
+        mavros_msgs::State uav_current_state_;
 
         bool has_taken_off_;            // Flag to check if takeoff has been initiated
         bool has_heading_target_;       // Flag to check if heading target has been set
@@ -101,5 +112,25 @@ namespace waypoint_navigator
         unsigned int waypoint_index_; // Current waypoint index
 
         PrintOnce print_once_; // Print once utility to avoid duplicate messages
+
+        ros::NodeHandle nh_;
+        ros::Subscriber cmd_sub_;
+        ros::Subscriber uav_state_sub_;
+        ros::Subscriber uav_pose_enu_sub_;
+
+        ros::Publisher local_pos_sp_pub_;
+        ros::Publisher local_raw_sp_pub_;
+
+        ros::ServiceClient arming_client_;
+        ros::ServiceClient takeoff_client_;
+        ros::ServiceClient land_client_;
+        ros::ServiceClient set_mode_client_;
+
+        ros::Timer mission_timer_;
+
+        geometry_msgs::PoseStamped uav_local_pose_enu_;
+        geometry_msgs::PoseStamped take_off_pose_enu_;
+        geometry_msgs::PoseStamped current_setpoint_;
+        double take_off_yaw_enu_;
     };
 } // namespace waypoint_navigator
