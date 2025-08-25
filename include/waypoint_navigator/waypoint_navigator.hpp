@@ -81,10 +81,16 @@ namespace waypoint_navigator
         void doRunMission();
         void doLand();
         bool setOffboardMode();
-        float normalize_angle(float angle_deg);
+        // // --- Mission steps
+        // bool alignToPathYaw(float north_wp, float east_wp, float up_wp, float &path_yaw);
+        // bool flyToWaypoint(float north, float east, float up, float path_yaw);
+        // bool alignToWaypointYaw(float north, float east, float up, float target_yaw_deg);
 
+        // --- Utilities
+        void publishPositionTarget(float east, float north, float up, float yaw_rad);
         double getYawFromPose(const geometry_msgs::PoseStamped &pose_msg);
         void setYawToPose(geometry_msgs::PoseStamped &pose_msg, double yaw);
+        float normalize_angle(float angle_deg);
 
         inline double deg2rad(double degrees)
         {
@@ -132,5 +138,6 @@ namespace waypoint_navigator
         geometry_msgs::PoseStamped take_off_pose_enu_;
         geometry_msgs::PoseStamped current_setpoint_;
         double take_off_yaw_enu_;
+        float take_off_height_;
     };
 } // namespace waypoint_navigator

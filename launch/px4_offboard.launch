@@ -1,0 +1,29 @@
+<launch>
+    <!-- Arguments -->
+    <arg name="waypoint_file" default="$(find px4_offboard)/config/waypoints.yaml" />
+    <arg name="takeoff_height" default="1.5" />
+    <arg name="use_sim" default="true" />
+
+    <!-- Load ROS params -->
+    <rosparam file="$(find px4_offboard)/config/params.yaml" command="load" />
+
+    <!-- PX4 Offboard node -->
+    <node pkg="px4_offboard" type="px4_offboard_node" name="px4_offboard_node" output="screen">
+        <param name="waypoint_file" value="$(arg waypoint_file)" />
+        <param name="takeoff_height" value="$(arg takeoff_height)" />
+    </node>
+
+    <!-- MAVROS launch for simulation -->
+    <group if="$(arg use_sim)">
+        <include file="$(find mavros)/launch/px4.launch">
+            <arg name="fcu_url" value="udp://:14540@127.0.0.1:14557" />
+        </include>
+    </group>
+
+    <!-- MAVROS launch for real hardware -->
+    <group unless="$(arg use_sim)">
+        <include file="$(find mavros)/launch/px4.launch">
+            <arg name="fcu_url" value="/dev/ttyS1:119200" />
+        </include>
+    </group>
+</launch>

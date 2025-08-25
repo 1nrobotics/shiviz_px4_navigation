@@ -25,6 +25,7 @@ namespace waypoint_navigator
             {5.0f, 5.0f, 1.5f, -90.0f},
             {0.0f, 5.0f, 1.5f, 180.0f}};
         nh_.param<std::string>("waypoint_file", waypoint_file_, "/path/to/default/waypoints.yaml");
+        nh_.param<float>("takeoff_height", take_off_height_, 3.5f);
 
         cmd_sub_ = nh_.subscribe<std_msgs::Byte>("/user_cmd", 1, &WaypointNavigator::cmdCallback, this);
         uav_state_sub_ = nh_.subscribe<mavros_msgs::State>("/mavros/state", 1, &WaypointNavigator::uavStateCallback, this);
@@ -40,7 +41,16 @@ namespace waypoint_navigator
 
         mission_timer_ = nh_.createTimer(ros::Duration(0.1), &WaypointNavigator::missionTimerCallback, this);
 
-        ROS_INFO("WaypointNavigator node is ready!");
+        if (this->loadWaypointsFromYaml(waypoint_file_))
+        {
+            ROS_INFO("WaypointNavigator node is ready! Loaded %zu waypoints from: %s; takeoff height: %.2f m",
+                     waypoints_.size(), waypoint_file_.c_str(), take_off_height_);
+        }
+        else
+        {
+            ROS_WARN("Failed to load waypoints from %s. Using default waypoints; takeoff height: %.2f m",
+                     waypoint_file_.c_str(), take_off_height_);
+        }
     }
 
     void WaypointNavigator::cmdCallback(const std_msgs::Byte::ConstPtr &msg)
@@ -94,7 +104,7 @@ namespace waypoint_navigator
             YAML::Node config = YAML::LoadFile(yaml_path);
             if (!config["waypoints"])
             {
-                std::cerr << "No 'waypoints' key found in YAML file: " << yaml_path << std::endl;
+                ROS_WARN("No 'waypoints' key found in YAML file: %s", yaml_path.c_str());
                 return false;
             }
 
@@ -104,7 +114,7 @@ namespace waypoint_navigator
             {
                 if (!node.IsSequence() || node.size() != 4)
                 {
-                    std::cerr << "Invalid waypoint format. Each waypoint must be a list of 4 floats [x, y, z, yaw]." << std::endl;
+                    ROS_ERROR("Invalid waypoint format in YAML. Each waypoint must be a list of 4 floats [x, y, z, yaw]. File: %s", yaml_path.c_str());
                     return false;
                 }
 
@@ -121,12 +131,12 @@ namespace waypoint_navigator
                 waypoints_ = std::move(loaded_waypoints);
             }
 
-            std::cout << "Successfully loaded " << waypoints_.size() << " waypoints from " << yaml_path << std::endl;
+            ROS_INFO("Successfully loaded %zu waypoints from %s", waypoints_.size(), yaml_path.c_str());
             return true;
         }
         catch (const YAML::Exception &e)
         {
-            std::cerr << "YAML parse error: " << e.what() << std::endl;
+            ROS_ERROR("YAML parse error in file %s: %s", yaml_path.c_str(), e.what());
             return false;
         }
     }
@@ -145,6 +155,7 @@ namespace waypoint_navigator
                 {
                     std::lock_guard<std::mutex> lock(pose_mutex_);
                     take_off_pose_enu_ = uav_local_pose_enu_;
+                    take_off_pose_enu_.pose.position.z = take_off_height_;
                     take_off_yaw_enu_ = getYawFromPose(uav_local_pose_enu_);
                     if (std::isnan(take_off_pose_enu_.pose.position.x) || std::isnan(take_off_pose_enu_.pose.position.y) ||
                         std::isnan(take_off_pose_enu_.pose.position.z) || std::isnan(take_off_yaw_enu_))
@@ -196,28 +207,47 @@ namespace waypoint_navigator
         geometry_msgs::PoseStamped local_pose_setpoint;
         local_pose_setpoint.pose.position.x = take_off_pose_enu_.pose.position.x;
         local_pose_setpoint.pose.position.y = take_off_pose_enu_.pose.position.y;
-        local_pose_setpoint.pose.position.z = 2.0;
+        local_pose_setpoint.pose.position.z = take_off_height_;
         local_pose_setpoint.header.stamp = ros::Time::now();
         setYawToPose(local_pose_setpoint, deg2rad(take_off_yaw_enu_));
         local_pos_sp_pub_.publish(local_pose_setpoint);
-        ROS_INFO("Vehicle taking off...");
+        ROS_INFO_THROTTLE(1.0, "Vehicle taking off...");
         return;
+    }
+
+    void WaypointNavigator::publishPositionTarget(float east, float north, float up, float yaw_rad)
+    {
+        mavros_msgs::PositionTarget sp;
+        sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+        sp.type_mask =
+            mavros_msgs::PositionTarget::IGNORE_VX |
+            mavros_msgs::PositionTarget::IGNORE_VY |
+            mavros_msgs::PositionTarget::IGNORE_VZ |
+            mavros_msgs::PositionTarget::IGNORE_AFX |
+            mavros_msgs::PositionTarget::IGNORE_AFY |
+            mavros_msgs::PositionTarget::IGNORE_AFZ |
+            mavros_msgs::PositionTarget::IGNORE_YAW_RATE;
+
+        sp.position.x = east;
+        sp.position.y = north;
+        sp.position.z = up;
+        sp.yaw = yaw_rad;
+
+        local_raw_sp_pub_.publish(sp);
     }
 
     void WaypointNavigator::doRunMission()
     {
         if (waypoints_.empty())
         {
-            std::cout << "Waypoints not loaded, aborting mission.\n";
-            // offboard_->stop();
+            ROS_INFO("Waypoints not loaded, aborting mission.");
             task_state_ = TaskState::LAND;
             return;
         }
 
         if (waypoint_index_ >= waypoints_.size())
         {
-            std::cout << "Mission complete. Initiating landing sequence.\n";
-            // offboard_->stop();
+            ROS_INFO("Mission complete. Initiating landing sequence.");
             task_state_ = TaskState::LAND;
             return;
         }
@@ -229,6 +259,7 @@ namespace waypoint_navigator
         float current_position_up;
         float current_yaw_from_north_rad;
 
+        // following lock is actually unnecessary since we deal with single-threaded application
         {
             std::lock_guard<std::mutex> lock(pose_mutex_);
             current_position_east = uav_local_pose_enu_.pose.position.x;
@@ -239,7 +270,7 @@ namespace waypoint_navigator
             if (std::isnan(current_position_north) || std::isnan(current_position_east) ||
                 std::isnan(current_position_up) || std::isnan(current_yaw_from_north_rad))
             {
-                std::cerr << "Error: One or more values of local pose feedback are NaN!" << std::endl;
+                ROS_ERROR("Error: One or more values of local pose feedback are NaN!");
                 // offboard_->stop();
                 task_state_ = TaskState::LAND;
             }
@@ -250,11 +281,10 @@ namespace waypoint_navigator
         {
             if (!has_heading_target_)
             {
+                // If we are still at the first waypoint, set the current setpoint to the takeoff position
                 if (waypoint_index_ == 0)
                 {
-                    current_setpoint_.pose.position.x = take_off_pose_enu_.pose.position.x;
-                    current_setpoint_.pose.position.y = take_off_pose_enu_.pose.position.y;
-                    current_setpoint_.pose.position.z = 2.0;
+                    current_setpoint_.pose.position = take_off_pose_enu_.pose.position;
                 }
                 else
                 {
@@ -268,8 +298,8 @@ namespace waypoint_navigator
                 double delta_east = east_wp - current_east;
                 double path_yaw_from_east = atan2(delta_north, delta_east);
                 setYawToPose(current_setpoint_, path_yaw_from_east);
-                print_once_("Setting heading target to: " + std::to_string(rad2deg(path_yaw_from_east)) + " degrees");
-
+                ROS_INFO_THROTTLE(1.0, "Setting heading target to: %.2f degrees",
+                                  rad2deg(path_yaw_from_east));
                 has_heading_target_ = true;
             }
 
@@ -278,7 +308,9 @@ namespace waypoint_navigator
             if (std::abs(heading_error) > 5.0f) // Allow some tolerance
             {
                 // std::cout << "waypoint index: " << waypoint_index_ << std::endl;
-                print_once_(" Aligning to path yaw (from north): " + std::to_string(rad2deg(getYawFromPose(current_setpoint_) - M_PI_2)) + ", remaining angle to adjust: " + std::to_string(heading_error) + " degrees");
+                ROS_INFO_THROTTLE(1.0, "Aligning to path yaw (from north): %.2f degrees, remaining angle to adjust: %.2f degrees",
+                                  rad2deg(getYawFromPose(current_setpoint_) - M_PI_2),
+                                  heading_error);
                 mavros_msgs::PositionTarget pose_sp;
                 pose_sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
                 // We want only position + yaw; ignore velocity, acceleration, and yaw rate
@@ -303,7 +335,8 @@ namespace waypoint_navigator
             }
             else
             {
-                print_once_("Aligned to path yaw from north: " + std::to_string(rad2deg(getYawFromPose(current_setpoint_) - M_PI_2)) + " degrees");
+                ROS_INFO_THROTTLE(1.0, "Aligned to path yaw from north: %.2f degrees",
+                                  rad2deg(getYawFromPose(current_setpoint_) - M_PI_2));
                 has_aligned_to_path_yaw_ = true; // Mark as aligned to path yaw
             }
         }
@@ -311,9 +344,6 @@ namespace waypoint_navigator
         // Step 2: Fly to waypoint position
         if (!has_reached_waypoint_pos_)
         {
-            print_once_("Going to waypoint " + std::to_string(waypoint_index_ + 1) +
-                        ": (" + std::to_string(north_wp) + ", " + std::to_string(east_wp) +
-                        ", " + std::to_string(up_wp) + ") with yaw " + std::to_string(yaw_wp_from_north));
             mavros_msgs::PositionTarget pose_sp;
             pose_sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
             // We want only position + yaw; ignore velocity, acceleration, and yaw rate
@@ -336,31 +366,34 @@ namespace waypoint_navigator
             float dz = up_wp - current_position_up;
             float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-            // std::cout << "Distance to waypoint " << (waypoint_index_ + 1) << ": " << dist << " meters\n";
-            // std::cout << "east_wp: " << east_wp << " meters\n";
-            // std::cout << "north_wp: " << north_wp << " meters\n";
-            // std::cout << "up_wp: " << up_wp << " meters\n";
-            // std::cout << "current_position_east: " << current_position_east << " meters\n";
-            // std::cout << "current_position_north: " << current_position_north << " meters\n";
-            // std::cout << "current_position_up: " << current_position_up << " meters\n";
-
+            ROS_INFO_THROTTLE(1.0, "Going to waypoint %u: (%.2f, %.2f, %.2f) with yaw %.1f degrees, remaining distance: %.2f meters",
+                              waypoint_index_ + 1,
+                              north_wp,
+                              east_wp,
+                              up_wp,
+                              yaw_wp_from_north,
+                              dist);
             if (dist < 0.2f)
             {
                 has_reached_waypoint_pos_ = true; // Mark as reached waypoint position
-                print_once_("Reached waypoint number: " + std::to_string(waypoint_index_ + 1) + "'s position" +
-                            ": (" + std::to_string(north_wp) + ", " + std::to_string(east_wp) +
-                            ", " + std::to_string(up_wp) + ")");
+                ROS_INFO_THROTTLE(1.0, "Reached waypoint %u position: (%.2f, %.2f, %.2f)",
+                                  waypoint_index_ + 1,
+                                  north_wp,
+                                  east_wp,
+                                  up_wp);
             }
 
             return;
         }
+
         // Step 3: Position reached, align to waypoint yaw
         float final_yaw_error = normalize_angle(yaw_wp_from_north - rad2deg(current_yaw_from_north_rad));
 
         if (std::abs(final_yaw_error) > 5.0f) // Allow some tolerance
         {
-            print_once_("Aligning to waypoint yaw: " + std::to_string(yaw_wp_from_north) +
-                        ", remaining angle to adjust: " + std::to_string(final_yaw_error) + " degrees");
+            ROS_INFO_THROTTLE(1.0, "Aligning to waypoint yaw: %.1f deg, remaining angle to adjust: %.1f deg",
+                              yaw_wp_from_north,
+                              final_yaw_error);
 
             mavros_msgs::PositionTarget pose_sp;
             pose_sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
@@ -380,7 +413,7 @@ namespace waypoint_navigator
             local_raw_sp_pub_.publish(pose_sp);
             return;
         }
-        std::cout << "Reached waypoint " << (waypoint_index_ + 1) << "\n";
+        ROS_INFO("Reached waypoint %u position and orientation.", waypoint_index_ + 1);
         waypoint_index_++;
         has_heading_target_ = false;       // Reset heading target for next waypoint
         has_aligned_to_path_yaw_ = false;  // Reset alignment for next waypoint
