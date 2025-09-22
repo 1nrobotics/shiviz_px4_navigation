@@ -19,6 +19,7 @@
 #include <mavros_msgs/AttitudeTarget.h>
 #include <mavros_msgs/CommandTOL.h>
 #include <mavros_msgs/HomePosition.h>
+#include <mavros_msgs/RCIn.h>
 #include <std_msgs/Byte.h>
 
 #include <tf/transform_listener.h>
@@ -73,6 +74,7 @@ namespace waypoint_navigator
         void uavStateCallback(const mavros_msgs::State::ConstPtr &msg);
         void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr &msg);
         void missionTimerCallback(const ros::TimerEvent &event);
+        void rcCallback(const mavros_msgs::RCIn::ConstPtr &msg);
 
         void commandLand();
 
@@ -103,6 +105,7 @@ namespace waypoint_navigator
         }
 
         std::atomic<TaskState> task_state_;
+        std::atomic<TaskState> last_task_state_;
         std::mutex pose_mutex_;
         std::mutex flight_mode_mutex_;
         std::vector<std::tuple<float, float, float, float>> waypoints_;
@@ -123,6 +126,7 @@ namespace waypoint_navigator
         ros::Subscriber cmd_sub_;
         ros::Subscriber uav_state_sub_;
         ros::Subscriber uav_pose_enu_sub_;
+        ros::Subscriber rc_sub_;
 
         ros::Publisher local_pos_sp_pub_;
         ros::Publisher local_raw_sp_pub_;
@@ -139,5 +143,7 @@ namespace waypoint_navigator
         geometry_msgs::PoseStamped current_setpoint_;
         double take_off_yaw_enu_;
         float take_off_height_;
+        bool use_rc_;
+        uint16_t last_ch8_;
     };
 } // namespace waypoint_navigator

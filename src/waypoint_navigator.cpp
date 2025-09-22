@@ -13,11 +13,13 @@ namespace waypoint_navigator
     WaypointNavigator::WaypointNavigator(ros::NodeHandle &node_handle)
         : nh_(node_handle),
           task_state_(TaskState::IDLE),
+          last_task_state_(TaskState::IDLE),
           has_taken_off_(false),
           has_heading_target_(false),
           has_aligned_to_path_yaw_(false),
           has_reached_waypoint_pos_(false),
-          waypoint_index_(0)
+          waypoint_index_(0),
+          last_ch8_(0)
     {
         // Define some example waypoints (north, east, up, yaw_deg)
         waypoints_ = {
@@ -26,8 +28,18 @@ namespace waypoint_navigator
             {0.0f, 5.0f, 1.5f, 180.0f}};
         nh_.param<std::string>("waypoint_file", waypoint_file_, "/path/to/default/waypoints.yaml");
         nh_.param<float>("takeoff_height", take_off_height_, 3.5f);
+        nh_.param<bool>("use_rc", use_rc_, false);
 
-        cmd_sub_ = nh_.subscribe<std_msgs::Byte>("/user_cmd", 1, &WaypointNavigator::cmdCallback, this);
+        if (!use_rc_)
+        {
+            ROS_WARN("Using offboard control without RC override. Ensure safety!");
+            cmd_sub_ = nh_.subscribe<std_msgs::Byte>("/user_cmd", 1, &WaypointNavigator::cmdCallback, this);
+        }
+        else
+        {
+            ROS_INFO("RC override enabled for safety.");
+            rc_sub_ = nh_.subscribe<mavros_msgs::RCIn>("/mavros/rc/in", 1, &WaypointNavigator::rcCallback, this);
+        }
         uav_state_sub_ = nh_.subscribe<mavros_msgs::State>("/mavros/state", 1, &WaypointNavigator::uavStateCallback, this);
         uav_pose_enu_sub_ = nh_.subscribe<geometry_msgs::PoseStamped>("/mavros/local_position/pose", 1, &WaypointNavigator::uavPoseCallback, this);
 
@@ -79,6 +91,59 @@ namespace waypoint_navigator
         default:
             ROS_WARN("Unknown command: %d", cmd);
             break;
+        }
+    }
+
+    void WaypointNavigator::rcCallback(const mavros_msgs::RCIn::ConstPtr &msg)
+    {
+        uint16_t ch7 = msg->channels[6]; // RCIn is 0-based index (ch7 is index 6)
+        uint16_t ch8 = msg->channels[7]; // ch8 is index 7
+
+        // LAND: Always takes priority
+        if (ch8 >= 1800 && ch8 <= 2000 && last_task_state_ != TaskState::LAND)
+        {
+            setTaskState(TaskState::LAND);
+            last_task_state_ = TaskState::LAND;
+            ROS_INFO("RC Command: LAND (CH8=%d)", ch8);
+            last_ch8_ = ch8;
+            return;
+        }
+
+        // IDLE: Edge-triggered only when entering 1000-1200 zone
+        if (ch8 >= 1000 && ch8 <= 1200 &&
+            !(last_ch8_ >= 1000 && last_ch8_ <= 1200) &&
+            last_task_state_ != TaskState::IDLE)
+        {
+            setTaskState(TaskState::IDLE);
+            ROS_INFO("RC Command: IDLE (CH8 %d -> CH8 %d)", last_ch8_, ch8);
+            last_task_state_ = TaskState::IDLE;
+            last_ch8_ = ch8;
+            return;
+        }
+
+        // Update CH8 for next call
+        last_ch8_ = ch8;
+
+        // TAKEOFF: only from IDLE
+        if (last_task_state_ == TaskState::IDLE && ch7 >= 1400 && ch7 <= 1600)
+        {
+            if (setOffboardMode())
+            {
+                ROS_INFO("offboard mode activated going to run takeoff");
+                setTaskState(TaskState::TAKEOFF);
+                last_task_state_ = TaskState::TAKEOFF;
+                ROS_INFO("RC Command: TAKEOFF (CH7=%d)", ch7);
+            }
+            return;
+        }
+
+        // MISSION: only from TAKEOFF
+        if (last_task_state_ == TaskState::TAKEOFF && ch7 >= 1800 && ch7 <= 2000)
+        {
+            setTaskState(TaskState::MISSION);
+            last_task_state_ = TaskState::MISSION;
+            ROS_INFO("RC Command: MISSION (CH7=%d)", ch7);
+            return;
         }
     }
 

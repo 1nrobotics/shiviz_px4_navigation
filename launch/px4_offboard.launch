@@ -3,6 +3,7 @@
     <arg name="waypoint_file" default="$(find px4_offboard)/config/waypoints.yaml" />
     <arg name="takeoff_height" default="1.5" />
     <arg name="use_sim" default="true" />
+    <arg name="use_rc" default="false" />
 
     <!-- Load ROS params -->
     <rosparam file="$(find px4_offboard)/config/params.yaml" command="load" />
@@ -11,6 +12,8 @@
     <node pkg="px4_offboard" type="px4_offboard_node" name="px4_offboard_node" output="screen">
         <param name="waypoint_file" value="$(arg waypoint_file)" />
         <param name="takeoff_height" value="$(arg takeoff_height)" />
+        <param name="use_rc" value="$(arg use_rc)" />
+
     </node>
 
     <!-- MAVROS launch for simulation -->
