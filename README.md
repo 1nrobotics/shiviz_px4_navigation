@@ -19,6 +19,7 @@ Channel 7 is a 3-position switch and will be used to control the state machine t
 Channel 8 is a 2-position swtich and will be used to control the state machine to go to ```LAND``` or ```IDLE``` mode.
 ### Control logic
 By default channel 7 and channel 8 should be both at upper position i.e with value 1000:
+- Step 0: Set Mode Switch to POSITION Mode
 - Step 1: Make sure the drone is clear from obstacles and in takeoff position.
 - Step 2: Flip channel 7 switch to center position i.e. with value ~1500. Drone will automatically arm and takeoff.
 - Step 3: After drone reaches takeoff height, flip channel 7 switch to bottom position i.e. with value ~1800. Drone will start to do waypoint mission.
