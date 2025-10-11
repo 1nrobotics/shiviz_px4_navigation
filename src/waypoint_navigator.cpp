@@ -19,7 +19,8 @@ namespace waypoint_navigator
           has_aligned_to_path_yaw_(false),
           has_reached_waypoint_pos_(false),
           waypoint_index_(0),
-          last_ch8_(0)
+          last_ch8_(0),
+          last_ch7_(0)
     {
         // Define some example waypoints (north, east, up, yaw_deg)
         waypoints_ = {
@@ -125,8 +126,9 @@ namespace waypoint_navigator
         last_ch8_ = ch8;
 
         // TAKEOFF: only from IDLE
-        if (last_task_state_ == TaskState::IDLE && ch7 >= 1400 && ch7 <= 1600)
+        if (last_task_state_ == TaskState::IDLE && ch7 >= 1400 && ch7 <= 1600 && !(last_ch7_ >= 1400 && last_ch7_ <= 1600))
         {
+            last_ch7_ = ch7;
             if (setOffboardMode())
             {
                 ROS_INFO("offboard mode activated going to run takeoff");
@@ -138,13 +140,16 @@ namespace waypoint_navigator
         }
 
         // MISSION: only from TAKEOFF
-        if (last_task_state_ == TaskState::TAKEOFF && ch7 >= 1800 && ch7 <= 2000)
+        if (last_task_state_ == TaskState::TAKEOFF && ch7 >= 1800 && ch7 <= 2000 && !(last_ch7_ >= 1800 && last_ch7_ <= 2000))
         {
+            last_ch7_ = ch7;
             setTaskState(TaskState::MISSION);
             last_task_state_ = TaskState::MISSION;
             ROS_INFO("RC Command: MISSION (CH7=%d)", ch7);
             return;
         }
+
+        last_ch7_ = ch7;
     }
 
     void WaypointNavigator::uavStateCallback(const mavros_msgs::State::ConstPtr &msg)

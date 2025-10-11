@@ -145,5 +145,6 @@ namespace waypoint_navigator
         float take_off_height_;
         bool use_rc_;
         uint16_t last_ch8_;
+        uint16_t last_ch7_;
     };
 } // namespace waypoint_navigator
